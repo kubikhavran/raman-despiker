@@ -10,9 +10,10 @@ __pycache__/
 venv/
 env/
 
-# Build / PyInstaller
+# Build / PyInstaller / instalátor
 build/
 dist/
+Output/
 *.spec.bak
 *.manifest
 
