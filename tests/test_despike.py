@@ -13,6 +13,22 @@ def _synthetic():
     return x, y
 
 
+def test_consensus_removes_spikes_keeps_bands():
+    from raman_despiker.consensus import consensus_despike_group
+    x, y0 = _synthetic()
+    Y = np.array([y0 + np.random.default_rng(i).normal(0, 40, y0.size) for i in range(8)])
+    # do každého spektra jiný spike na jiné pozici
+    for i, pos in enumerate((300, 900, 1500, 2100, 2700, 400, 1800, 2400)):
+        Y[i, pos] += 9000
+    cleaned, masks = consensus_despike_group(Y, threshold=6.0)
+    for i, pos in enumerate((300, 900, 1500, 2100, 2700, 400, 1800, 2400)):
+        assert masks[i, pos], f"konsenzus nenašel spike ve spektru {i}"
+    # reálný pík na 1600 se nesmí zkreslit (výška zachována v rámci šumu)
+    peak_idx = np.argmin(np.abs(x - 1600))
+    for i in range(Y.shape[0]):
+        assert abs(cleaned[i, peak_idx] - Y[i, peak_idx]) < 300
+
+
 def test_removes_single_spike():
     x, y = _synthetic()
     y_spiked = y.copy()

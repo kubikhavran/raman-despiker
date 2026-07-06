@@ -1,74 +1,88 @@
 """Despiking (odstranění kosmických spiků / gamma-ray anomálií) Ramanových spekter.
 
-Princip
--------
-Kosmické spiky jsou velmi úzké (typicky 1-3 body) a ostré, zatímco skutečné
-Ramanovy pásy jsou široké (mnoho bodů). Toho využíváme:
+Princip (single-spectrum režim)
+-------------------------------
+Kosmické spiky jsou úzké (na tomto přístroji měřeno FWHM ≤ ~5 bodů), zatímco
+skutečné Ramanovy pásy jsou širší (FWHM ≥ ~7 bodů). Mezi tím je bezpečná mezera.
 
-1. Od spektra odečteme klouzavý medián (malé okno) -> reziduum.
-   Široké reálné pásy medián zachová (reziduum malé), úzký spike ne
-   (reziduum velké).
-2. Odlehlé body detekujeme robustním modifikovaným Z-skóre (medián + MAD).
-   MAD je odolné vůči odlehlým hodnotám, takže práh sedí i u zašuměných spekter.
-   Volitelně lokálně adaptivní měřítko -> chytá malé spiky v klidných úsecích
-   i velké v hlučných.
-3. Ochrana reálných píků: označí se jen souvislé úseky do zadané maximální
-   šířky (širší útvar = reálný pás, ne spike).
-4. Nahrazení: označené body se nahradí lineární interpolací z okolních
-   *čistých* bodů. Zbytek spektra zůstává beze změny (žádné zkreslení).
+1. Od spektra odečteme klouzavý medián (okno širší než spike, užší než reálný
+   pás) -> reziduum. Reálné pásy medián zachová (malé reziduum), spike ne.
+2. Šum odhadneme z **druhých diferencí** — ten je necitlivý na lineární sklon,
+   takže se spike pozná i na hraně/vrcholu reálného píku. Lokálně adaptivní.
+3. Modifikované Z-skóre rezidua se prahuje s **hysterezí**: jádro spiku |z|>práh
+   se rozšíří na okolní body |z|>práh/2 (zachytí i širší spike a jeho boky).
+4. Ochrana reálných pásů: souvislý označený úsek delší než width_cap se odznačí
+   (širší útvar = reálný pás, ne spike).
+5. Nahrazení lineární interpolací z čistých sousedů; zbytek spektra beze změny.
+6. Iterace: po odstranění velkých spiků klesne šum a odhalí se menší.
 
-Metoda vychází z principu Whitaker & Hayes, "A simple algorithm for despiking
-Raman spectra", Chemom. Intell. Lab. Syst. 179 (2018) 82-84.
+Vychází z principu Whitaker & Hayes (2018) rozšířeného o měřením podložené
+šířkové kritérium a odhad šumu z druhých diferencí.
+
+Pozn.: Pro opakovaná měření téhož vzorku existuje spolehlivější konsenzuální
+režim napříč spektry — viz modul `consensus`.
 """
 from __future__ import annotations
 
 import numpy as np
 from scipy.ndimage import median_filter
 
+# ---- výchozí parametry (podložené měřením na trénovacích datech) ----
+DEFAULT_THRESHOLD = 6.0
+DEFAULT_MED_KERNEL = 5      # okno mediánu pro odhad hladkého pozadí
+DEFAULT_WIDTH_CAP = 5       # delší souvislý úsek = reálný pás -> neodstraní se
+DEFAULT_ITERATIONS = 5
+DEFAULT_ADAPT_WINDOW = 151  # okno (v pořadí dle úrovně signálu) pro model šumu
+HYSTERESIS_FRAC = 0.5       # spodní práh pro rozšíření spiku (× threshold)
+
 
 def _as_odd(n: int) -> int:
-    """Vrátí nejbližší liché kladné číslo (median_filter chce liché okno)."""
     n = int(round(n))
     if n < 1:
         n = 1
-    if n % 2 == 0:
-        n += 1
-    return n
-
-
-def _mad_sigma(a: np.ndarray) -> tuple[float, float]:
-    """Robustní odhad rozptylu (sigma z MAD) a mediánu."""
-    med = float(np.median(a))
-    mad = float(np.median(np.abs(a - med)))
-    return 1.4826 * mad, med
+    return n + 1 if n % 2 == 0 else n
 
 
 def _noise_sigma(y: np.ndarray, window: int, adaptive: bool) -> np.ndarray:
-    """Robustní odhad šumu z rozdílů sousedních bodů.
+    """Odhad šumu závislý na úrovni signálu (model shot-noise).
 
-    Pro bílý šum má diff rozptyl 2*sigma^2, proto dělíme sqrt(2). Odhad z diferencí
-    je odolný vůči (řídkým) spikům a při lokální variantě respektuje shot-noise,
-    který roste u silného signálu (píky, vysoké pozadí).
+    Šum v Ramanově spektru roste s intenzitou (shot-noise ~ sqrt(signál)), takže
+    vrchol silného píku má velký šum. Kdybychom používali jednu globální úroveň
+    šumu, ostrá špička reálného píku by vypadala jako spike. Proto:
+
+    1. Šumový proxy = absolutní 2. diference (necitlivá na lineární sklon).
+    2. Hladké pozadí (medián) udává úroveň signálu v každém bodě.
+    3. Body seřadíme podle úrovně signálu a spočteme klouzavý medián proxy v
+       tomto pořadí -> sigma jako rostoucí funkce signálu. Vrchol píku (vysoký
+       signál) tak dostane velký šum (nízké z), spike na pozadí malý (vysoké z).
+
+    Pro bílý šum má 2. diference rozptyl 6*sigma^2 -> dělíme sqrt(6).
     """
     n = y.size
-    d = np.diff(y)
-    med_d = float(np.median(d))
-    mad_g = float(np.median(np.abs(d - med_d)))
-    sigma_g = 1.4826 * mad_g / np.sqrt(2.0)
+    d2 = np.diff(y, 2)  # délka n-2
+    med = float(np.median(d2))
+    ad2 = np.abs(d2 - med)
+    sigma_g = 1.4826 * float(np.median(ad2)) / np.sqrt(6.0)
     if not np.isfinite(sigma_g) or sigma_g <= 0:
-        sigma_g = float(np.std(d)) / np.sqrt(2.0) or 1.0
+        sigma_g = float(np.std(d2)) / np.sqrt(6.0) or 1.0
 
-    if adaptive and window and window > 3:
+    # proxy do bodové domény (délka n)
+    ap = np.empty(n)
+    ap[1:-1] = ad2
+    ap[0] = ad2[0] if ad2.size else 0.0
+    ap[-1] = ad2[-1] if ad2.size else 0.0
+
+    if adaptive and window and window > 3 and n > 5:
         w = _as_odd(window)
-        if w >= d.size:
-            w = _as_odd(max(3, d.size - 1))
-        # median(|d|) ~ MAD(d) (median rozdílů je ~0) -> lokální úroveň šumu
-        local = median_filter(np.abs(d - med_d), size=w, mode="nearest")
-        sigma_l = 1.4826 * local / np.sqrt(2.0)
-        sigma_pts = np.empty(n)
-        sigma_pts[1:] = sigma_l
-        sigma_pts[0] = sigma_l[0]
-        sigma = np.maximum(sigma_pts, 0.3 * sigma_g)
+        if w >= n:
+            w = _as_odd(n - 1)
+        base = median_filter(y, size=_as_odd(11) if n > 11 else _as_odd(n - 1),
+                             mode="nearest")
+        order = np.argsort(base, kind="mergesort")
+        s_sorted = median_filter(ap[order], size=w, mode="nearest")
+        sigma = np.empty(n)
+        sigma[order] = 1.4826 * s_sorted / np.sqrt(6.0)
+        sigma = np.maximum(sigma, 0.3 * sigma_g)
     else:
         sigma = np.full(n, sigma_g)
 
@@ -76,12 +90,27 @@ def _noise_sigma(y: np.ndarray, window: int, adaptive: bool) -> np.ndarray:
     return sigma
 
 
-def _width_guard(flags: np.ndarray, max_width: int) -> np.ndarray:
-    """Ponechá označené jen souvislé úseky délky <= max_width.
+def _hysteresis(strong: np.ndarray, weak: np.ndarray) -> np.ndarray:
+    """Rozšíří jádra (strong) na souvislé úseky splňující weak."""
+    out = np.zeros_like(strong)
+    n = len(strong)
+    i = 0
+    while i < n:
+        if weak[i]:
+            j = i
+            while j < n and weak[j]:
+                j += 1
+            if strong[i:j].any():
+                out[i:j] = True
+            i = j
+        else:
+            i += 1
+    return out
 
-    Chrání reálné (širší) píky před smazáním. max_width <= 0 = bez ochrany.
-    """
-    if max_width <= 0:
+
+def _width_guard(flags: np.ndarray, max_run: int) -> np.ndarray:
+    """Odznačí souvislé úseky delší než max_run (chrání reálné pásy)."""
+    if max_run <= 0:
         return flags
     out = flags.copy()
     n = len(flags)
@@ -91,7 +120,7 @@ def _width_guard(flags: np.ndarray, max_width: int) -> np.ndarray:
             j = i
             while j < n and flags[j]:
                 j += 1
-            if (j - i) > max_width:
+            if (j - i) > max_run:
                 out[i:j] = False
             i = j
         else:
@@ -101,76 +130,61 @@ def _width_guard(flags: np.ndarray, max_width: int) -> np.ndarray:
 
 def detect_spikes(
     y,
-    threshold: float = 6.0,
-    med_kernel: int = 5,
-    max_width: int = 3,
+    threshold: float = DEFAULT_THRESHOLD,
+    med_kernel: int = DEFAULT_MED_KERNEL,
+    width_cap: int = DEFAULT_WIDTH_CAP,
     adaptive: bool = True,
-    adapt_window: int = 51,
-    min_scale_frac: float = 0.3,
+    adapt_window: int = DEFAULT_ADAPT_WINDOW,
 ):
-    """Detekuje spiky. Vrací (flags: bool[N], zscore: float[N]).
-
-    Parameters
-    ----------
-    threshold : práh modifikovaného Z-skóre. Nižší = citlivější (víc spiků).
-    med_kernel : okno klouzavého mediánu pro odhad hladkého pozadí.
-    max_width : max. šířka spiku v bodech (ochrana reálných píků).
-    adaptive : lokálně adaptivní měřítko šumu.
-    adapt_window : okno pro lokální odhad šumu (v bodech).
-    min_scale_frac : dolní mez lokálního měřítka jako podíl globálního
-                     (brání falešným detekcím v naprosto plochých úsecích).
-    """
+    """Detekuje spiky. Vrací (flags: bool[N], zscore: float[N])."""
     y = np.asarray(y, dtype=float)
     n = y.size
-    if n < 5:
+    if n < 7:
         return np.zeros(n, dtype=bool), np.zeros(n)
 
     k = _as_odd(med_kernel)
     if k >= n:
         k = _as_odd(n - 1)
-    # hladké pozadí; u spiku vrátí medián okna (spike sám je z mediánu vyloučen)
     base = median_filter(y, size=k, mode="nearest")
     resid = y - base
-
-    # úroveň šumu z rozdílů sousedních bodů (lokálně adaptivní = respektuje shot-noise)
     sigma = _noise_sigma(y, adapt_window, adaptive)
-
     z = resid / sigma
-    flags = np.abs(z) > threshold
-    flags = _width_guard(flags, max_width)
+
+    az = np.abs(z)
+    strong = az > threshold
+    weak = az > threshold * HYSTERESIS_FRAC
+    flags = _hysteresis(strong, weak)
+    flags = _width_guard(flags, width_cap)
     return flags, z
 
 
 def despike(
     y,
-    threshold: float = 6.0,
-    med_kernel: int = 5,
-    max_width: int = 3,
-    iterations: int = 3,
+    threshold: float = DEFAULT_THRESHOLD,
+    med_kernel: int = DEFAULT_MED_KERNEL,
+    width_cap: int = DEFAULT_WIDTH_CAP,
+    iterations: int = DEFAULT_ITERATIONS,
     adaptive: bool = True,
-    adapt_window: int = 51,
+    adapt_window: int = DEFAULT_ADAPT_WINDOW,
 ):
     """Odstraní spiky ze spektra.
 
-    Iterativně (výchozí 3x): po nahrazení největších spiků klesne MAD a odhalí
-    se i menší spiky, které byly "schované" vedle větších. Konverguje rychle.
-
     Returns
     -------
-    cleaned : np.ndarray  -- vyčištěné intenzity (stejná délka jako y).
+    cleaned : np.ndarray  -- vyčištěné intenzity.
     mask    : np.ndarray(bool) -- True tam, kde byl bod nahrazen.
     """
     y = np.asarray(y, dtype=float)
     n = y.size
     cleaned = y.copy()
     total = np.zeros(n, dtype=bool)
-    if n < 5:
+    if n < 7:
         return cleaned, total
 
     idx = np.arange(n)
     for _ in range(max(1, iterations)):
         flags, _z = detect_spikes(
-            cleaned, threshold, med_kernel, max_width, adaptive, adapt_window
+            cleaned, threshold, med_kernel, width_cap, adaptive, adapt_window
         )
         new = flags & ~total
         if not new.any():
@@ -179,16 +193,14 @@ def despike(
         good = ~total
         if good.sum() < 2:
             break
-        # interpolace pouze přes označené body z čistých sousedů
         cleaned[total] = np.interp(idx[total], idx[good], cleaned[good])
 
     return cleaned, total
 
 
 def despike_spectrum(x, y, **kwargs):
-    """Pohodlný wrapper: seřadí podle x (interpolace pracuje v pořadí bodů),
-    despikuje a vrátí (x, cleaned, mask) v původním pořadí vstupu.
-    """
+    """Seřadí podle x (interpolace pracuje v pořadí bodů), despikuje a vrátí
+    (x, cleaned, mask) v původním pořadí vstupu."""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     order = np.argsort(x)

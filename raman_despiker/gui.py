@@ -17,9 +17,9 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
-from .batch import DespikeParams, process_folder
+from .batch import DespikeParams, process_folder, process_folder_consensus
 from .despike import despike_spectrum
-from .io_loaders import Spectrum, list_spectra_files, load_any
+from .io_loaders import Spectrum, list_spectra_files, load_any, write_txt
 
 APP_NAME = "Raman Despiker"
 
@@ -32,12 +32,13 @@ class BatchWorker(QtCore.QObject):
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_dir, output_dir, params, recursive):
+    def __init__(self, input_dir, output_dir, params, recursive, use_consensus=False):
         super().__init__()
         self.input_dir = input_dir
         self.output_dir = output_dir
         self.params = params
         self.recursive = recursive
+        self.use_consensus = use_consensus
 
     @QtCore.Slot()
     def run(self):
@@ -45,10 +46,16 @@ class BatchWorker(QtCore.QObject):
             def cb(done, total, msg):
                 self.progress.emit(done, total, msg)
 
-            summary = process_folder(
-                self.input_dir, self.output_dir, self.params,
-                recursive=self.recursive, progress=cb,
-            )
+            if self.use_consensus:
+                summary = process_folder_consensus(
+                    self.input_dir, self.output_dir, self.params,
+                    recursive=self.recursive, progress=cb,
+                )
+            else:
+                summary = process_folder(
+                    self.input_dir, self.output_dir, self.params,
+                    recursive=self.recursive, progress=cb,
+                )
             self.finished.emit(summary)
         except Exception:
             self.failed.emit(traceback.format_exc())
@@ -68,6 +75,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_specs: list[Spectrum] = []
         self._thread: QtCore.QThread | None = None
         self._worker: BatchWorker | None = None
+        # ruční úpravy: klíč (source, index) -> set indexů (v pořadí dle x) k odstranění
+        self._manual: dict[tuple, set] = {}
 
         self._build_ui()
 
@@ -119,6 +128,13 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar = NavigationToolbar(self.canvas, self)
         right.addWidget(toolbar)
         right.addWidget(self.canvas, 1)
+        self.canvas.mpl_connect("button_press_event", self.on_canvas_click)
+
+        hint = QtWidgets.QLabel(
+            "Tip: levý klik do grafu ručně odstraní zbylý spike, pravý klik úpravu vrátí."
+        )
+        hint.setStyleSheet("color: #666; font-size: 11px;")
+        right.addWidget(hint)
 
         # zobrazovací přepínače
         show_row = QtWidgets.QHBoxLayout()
@@ -136,8 +152,26 @@ class MainWindow(QtWidgets.QMainWindow):
         show_row.addWidget(self.lbl_spike_count)
         right.addLayout(show_row)
 
+        # --- konsenzuální režim ---
+        self.chk_consensus = QtWidgets.QCheckBox(
+            "Opakovaná měření téhož vzorku — konsenzuální režim (spolehlivější)"
+        )
+        self.chk_consensus.setToolTip(
+            "Pro složku, kde je více měření TÉHOŽ vzorku na stejné ose X. Spiky se "
+            "poznají porovnáním se skupinovým mediánem (dopadají náhodně, v mediánu "
+            "nejsou). Nejspolehlivější varianta. NEpoužívej pro směs různých vzorků."
+        )
+        right.addWidget(self.chk_consensus)
+
         # --- spodní lišta: zpracovat + progress ---
         bottom = QtWidgets.QHBoxLayout()
+        self.btn_save_one = QtWidgets.QPushButton("💾  Uložit zobrazené…")
+        self.btn_save_one.setToolTip(
+            "Uloží právě zobrazené vyčištěné spektrum (včetně ručních úprav) do .txt."
+        )
+        self.btn_save_one.clicked.connect(self.save_current)
+        self.btn_save_one.setEnabled(False)
+        bottom.addWidget(self.btn_save_one)
         self.btn_process = QtWidgets.QPushButton("⚙  Zpracovat vše a uložit…")
         self.btn_process.clicked.connect(self.process_all)
         self.btn_process.setEnabled(False)
@@ -185,17 +219,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.spin_width = QtWidgets.QSpinBox()
         self.spin_width.setRange(1, 15)
-        self.spin_width.setValue(3)
+        self.spin_width.setValue(5)
         self.spin_width.setToolTip(
-            "Maximální šířka spiku v bodech. Širší útvary se považují za reálné "
-            "pásy a nemažou se. Chrání reálné píky."
+            "Maximální šířka spiku v bodech. Delší souvislý útvar se považuje za "
+            "reálný pás a nemaže se. Chrání reálné píky (na tomto přístroji mají "
+            "reálné pásy >= ~7 bodů, spiky <= ~5)."
         )
         self.spin_width.valueChanged.connect(self.update_preview)
-        form.addRow("Max. šířka spiku:", self.spin_width)
+        form.addRow("Max. šířka spiku (px):", self.spin_width)
 
         self.spin_iter = QtWidgets.QSpinBox()
         self.spin_iter.setRange(1, 10)
-        self.spin_iter.setValue(3)
+        self.spin_iter.setValue(5)
         self.spin_iter.setToolTip("Počet iterací (odhalí menší spiky vedle velkých).")
         self.spin_iter.valueChanged.connect(self.update_preview)
         form.addRow("Iterace:", self.spin_iter)
@@ -227,16 +262,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return DespikeParams(
             threshold=self.spin_thr.value(),
             med_kernel=self.spin_kernel.value(),
-            max_width=self.spin_width.value(),
+            width_cap=self.spin_width.value(),
             iterations=self.spin_iter.value(),
             adaptive=self.chk_adaptive.isChecked(),
-            adapt_window=51,
+            adapt_window=151,
         )
 
     def reset_params(self):
         self.spin_thr.setValue(6.0)
-        self.spin_width.setValue(3)
-        self.spin_iter.setValue(3)
+        self.spin_width.setValue(5)
+        self.spin_iter.setValue(5)
         self.spin_kernel.setValue(5)
         self.chk_adaptive.setChecked(True)
 
@@ -289,19 +324,85 @@ class MainWindow(QtWidgets.QMainWindow):
         idx = min(self.spin_spec.value() - 1, len(self.current_specs) - 1)
         return self.current_specs[idx]
 
+    def _spec_key(self, spec: Spectrum) -> tuple:
+        return (spec.source, spec.index)
+
     def update_preview(self):
         spec = self._current_spectrum()
         if spec is None:
             return
         p = self.current_params()
+        x = np.asarray(spec.x, float)
+        y = np.asarray(spec.y, float)
         try:
-            x, cleaned, mask = despike_spectrum(spec.x, spec.y, **p.as_kwargs())
+            _x, cleaned, auto_mask = despike_spectrum(x, y, **p.as_kwargs())
         except Exception as e:
             self.status.showMessage(f"Chyba výpočtu: {e}")
             return
-        self._preview = (np.asarray(spec.x, float), np.asarray(spec.y, float), cleaned, mask)
-        self.lbl_spike_count.setText(f"Spiků: {int(mask.sum())}")
+
+        # ruční úpravy
+        manual = self._manual.get(self._spec_key(spec), set())
+        combined = auto_mask.copy()
+        n_manual = 0
+        if manual:
+            manual_arr = np.zeros(len(x), dtype=bool)
+            for i in manual:
+                if 0 <= i < len(x):
+                    manual_arr[i] = True
+            combined = auto_mask | manual_arr
+            order = np.argsort(x)
+            inv = np.argsort(order)
+            cs = cleaned[order]
+            cm = combined[order]
+            good = ~cm
+            if good.sum() >= 2 and cm.any():
+                pos = np.arange(len(x))
+                cs[cm] = np.interp(pos[cm], pos[good], cs[good])
+            cleaned = cs[inv]
+            n_manual = int(manual_arr.sum())
+
+        self._preview = (x, y, cleaned, combined)
+        self.lbl_spike_count.setText(
+            f"Spiků: {int(combined.sum())}" + (f"  (ruční: {n_manual})" if n_manual else "")
+        )
+        self.btn_save_one.setEnabled(True)
         self.redraw()
+
+    def on_canvas_click(self, event):
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+        spec = self._current_spectrum()
+        if spec is None:
+            return
+        x = np.asarray(spec.x, float)
+        y = np.asarray(spec.y, float)
+        k = int(np.argmin(np.abs(x - event.xdata)))
+        ms = self._manual.setdefault(self._spec_key(spec), set())
+        if event.button == 1:  # levý klik: odstraň nejbližší lokální maximum
+            lo, hi = max(0, k - 3), min(len(x), k + 4)
+            kk = lo + int(np.argmax(y[lo:hi]))
+            ms.add(kk)
+        elif event.button == 3:  # pravý klik: vrať ruční úpravu v okolí
+            for i in [j for j in ms if abs(j - k) <= 3]:
+                ms.discard(i)
+        self.update_preview()
+
+    def save_current(self):
+        if self._preview is None:
+            return
+        spec = self._current_spectrum()
+        x, y, cleaned, mask = self._preview
+        default = os.path.join(self.input_dir or "", f"{spec.name}_despiked.txt")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Uložit zobrazené spektrum", default, "Text (*.txt)"
+        )
+        if not path:
+            return
+        try:
+            write_txt(path, x, cleaned)
+            self.status.showMessage(f"Uloženo: {path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, APP_NAME, f"Chyba uložení:\n{e}")
 
     def redraw(self):
         if self._preview is None:
@@ -355,7 +456,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setValue(0)
 
         self._thread = QtCore.QThread()
-        self._worker = BatchWorker(self.input_dir, out, params, recursive)
+        self._worker = BatchWorker(
+            self.input_dir, out, params, recursive,
+            use_consensus=self.chk_consensus.isChecked(),
+        )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)
