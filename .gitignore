@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+
+# Virtuální prostředí
+.venv/
+venv/
+env/
+
+# Build / PyInstaller
+build/
+dist/
+*.spec.bak
+*.manifest
+
+# Výstupy zpracování / data
+despiked/
+*.wdf
+# (necommitujeme velká měřicí data)
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
