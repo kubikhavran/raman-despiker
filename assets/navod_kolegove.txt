@@ -1,0 +1,88 @@
+========================================================================
+  RAMAN DESPIKER  —  odstranění kosmických spiků z Ramanových spekter
+========================================================================
+
+Aplikace hromadně odstraní kosmické spiky (gamma-ray anomálie) ze všech
+spekter ve vybrané složce a uloží vyčištěná spektra. Umí náhled před/po,
+takže hned vidíte, že proces spektrum nezkreslil.
+
+
+------------------------------------------------------------------------
+1) INSTALACE
+------------------------------------------------------------------------
+
+  1. Spusťte dvojklikem soubor:  RamanDespiker_Setup.exe
+  2. Projděte instalací (Další > Nainstalovat > Dokončit).
+  3. Aplikaci pak najdete v nabídce Start a na ploše jako "Raman Despiker".
+
+  Nepotřebujete Python ani nic doinstalovávat. Nejsou potřeba admin práva.
+
+  POZNÁMKA — modré okno "Windows ochránil váš počítač":
+  Aplikace není podepsaná placeným certifikátem, proto Windows SmartScreen
+  může při prvním spuštění zobrazit varování. Je to neškodné:
+      -> klikněte na "Více informací"  ->  "Přesto spustit".
+
+
+------------------------------------------------------------------------
+2) PODPOROVANÁ DATA
+------------------------------------------------------------------------
+
+  Vstup:   .txt  (dva sloupce: osa X a intenzita; i s indexovým sloupcem)
+           .wdf  (nativní formát Renishaw inVia; i soubory s více spektry)
+
+  Výstup:  .txt  (dva sloupce: osa X <tab> intenzita)
+
+
+------------------------------------------------------------------------
+3) POUŽITÍ (krok za krokem)
+------------------------------------------------------------------------
+
+  1. Klikněte na "Otevřít složku…" a vyberte složku se spektry.
+     (Zaškrtnutím "Včetně podsložek" projde i vnořené složky.)
+
+  2. V seznamu vlevo klikáním procházíte jednotlivá spektra.
+     V grafu vidíte:
+        - červeně  = původní spektrum
+        - zeleně   = vyčištěné
+        - kroužky  = detekované spiky
+
+  3. Posuvníkem "Práh (citlivost)" doladíte citlivost:
+        - nižší číslo = citlivější (odstraní i menší spiky)
+        - vyšší číslo = opatrnější
+     Změnu vidíte v náhledu okamžitě. Výchozí hodnota (6) je bezpečná.
+
+  4. Klikněte na "Zpracovat vše a uložit…", vyberte výstupní složku.
+     Aplikace projde všechna spektra a uloží vyčištěné .txt soubory.
+
+
+------------------------------------------------------------------------
+4) OPAKOVANÁ MĚŘENÍ TÉHOŽ VZORKU (nejspolehlivější režim)
+------------------------------------------------------------------------
+
+  Pokud složka obsahuje více měření TÉHOŽ vzorku (stejná osa X), zaškrtněte
+  dole "Opakovaná měření téhož vzorku — konsenzuální režim". Spiky se pak
+  poznají porovnáním všech spekter navzájem (kosmické spiky dopadají náhodně)
+  a odstraní se prakticky všechny, bez rizika zkreslení reálných pásů.
+
+  NEPOUŽÍVEJTE pro složku s různými vzorky.
+
+
+------------------------------------------------------------------------
+5) RUČNÍ DOLADĚNÍ (kdyby někde zůstal spike)
+------------------------------------------------------------------------
+
+  V náhledu:
+     - LEVÝ klik do grafu    = ručně odstraní zbylý spike v daném místě
+     - PRAVÝ klik            = úpravu vrátí zpět
+  Tlačítkem "Uložit zobrazené…" uložíte právě zobrazené (i ručně upravené)
+  spektrum do .txt.
+
+
+------------------------------------------------------------------------
+  Jak to funguje (stručně): reálné Ramanovy pásy jsou široké, kosmické
+  spiky úzké. Aplikace odhaduje šum podle úrovně signálu (vrchol silného
+  píku má velký šum, takže se nesmaže) a nahrazuje jen úzké odlehlé body
+  interpolací ze sousedů — zbytek spektra zůstává beze změny.
+
+  Otázky / chyby hlaste: Jakub Havránek (jakubhavranek120@gmail.com)
+========================================================================
